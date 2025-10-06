@@ -1,7 +1,12 @@
-import React, { useState, useEffect } from 'react';
-import { Menu, X, Droplet, Waves, Anchor, BarChart3, MapPin, ChevronRight, Download, ExternalLink } from 'lucide-react';
+import React, { useState, useEffect, useCallback } from 'react';
+import { Menu, X, Droplet, Waves, Anchor, BarChart3, MapPin, ChevronRight, Download, ExternalLink, Check, AlertTriangle, Sparkles } from 'lucide-react';
 
-// --- Variáveis de Estilo (Definidas Globalmente para Manter o Estilo Minimalista e Flat) ---
+// FIREBASE IMPORTS (Requeridos para o Canvas)
+import { initializeApp } from 'firebase/app';
+import { getAuth, signInAnonymously, signInWithCustomToken, onAuthStateChanged } from 'firebase/auth';
+import { getFirestore, doc, getDoc, addDoc, setDoc, updateDoc, deleteDoc, onSnapshot, collection, query, where } from 'firebase/firestore';
+
+// --- Variáveis de Estilo (Mantendo o design Minimalista e Flat) ---
 const COLORS = {
   primaryNavy: '#00204A',
   accentCyan: '#00A896',
@@ -9,85 +14,138 @@ const COLORS = {
   neutralBlack: '#000000',
 };
 
-// --- Custom Hook para Lógica e Dados (Simulação de API) ---
-const useMareFuturoData = () => {
+// --- Funções de Utilitário para API Gemini ---
+const MAX_RETRIES = 5;
+const INITIAL_DELAY = 1000;
+const API_KEY = ""; // Chave de API é fornecida pelo ambiente
+const API_URL = `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash-preview-05-20:generateContent?key=${API_KEY}`;
+
+/**
+ * Função para fazer fetch com lógica de backoff exponencial em caso de falha.
+ */
+const fetchWithExponentialBackoff = async (url, options) => {
+    for (let i = 0; i < MAX_RETRIES; i++) {
+        try {
+            const response = await fetch(url, options);
+            if (!response.ok && response.status === 429) {
+                throw new Error('Rate limit exceeded');
+            }
+            if (!response.ok) {
+                // Tenta ler a resposta para obter detalhes do erro, se disponível
+                const errorBody = await response.text();
+                throw new Error(`HTTP error! status: ${response.status}. Body: ${errorBody.substring(0, 100)}...`);
+            }
+            return response;
+        } catch (error) {
+            if (i === MAX_RETRIES - 1) throw error; // Re-throw on last attempt
+            const delay = INITIAL_DELAY * Math.pow(2, i) + Math.random() * 1000;
+            // console.log(`Retry ${i + 1}/${MAX_RETRIES} after ${delay.toFixed(0)}ms due to error: ${error.message}`);
+            await new Promise(resolve => setTimeout(resolve, delay));
+        }
+    }
+};
+
+// --- Custom Hook para Lógica de Dados (Firestore) ---
+const useMareFuturoData = (db, isFirebaseReady) => {
   const [isLoading, setIsLoading] = useState(true);
   const [stats, setStats] = useState({
-    lixoColetado: 45230,
-    kmLimpos: 1847,
-    robosAtivos: 8,
-    pesquisasAtivas: 127
+    lixoColetado: 0,
+    kmLimpos: 0,
+    robosAtivos: 0,
+    pesquisasAtivas: 0
   });
+  const [robots, setRobots] = useState([]);
+  const appId = typeof __app_id !== 'undefined' ? __app_id : 'default-app-id';
 
-  const [robots, setRobots] = useState([
-    { 
-      id: 1, 
-      nome: 'Guardião I', 
-      lat: 50, 
-      lng: 35, 
-      status: 'operacao',
-      kmLimpos: 234.5,
-      lixoColetado: 1450,
-      patrocinador: 'Petrobras'
-    },
-    { 
-      id: 2, 
-      nome: 'Protetor II', 
-      lat: 45, 
-      lng: 60, 
-      status: 'carregando',
-      kmLimpos: 198.2,
-      lixoColetado: 1120,
-      patrocinador: 'Vale'
-    },
-    { 
-      id: 3, 
-      nome: 'Onda Azul III', 
-      lat: 70, 
-      lng: 45, 
-      status: 'operacao',
-      kmLimpos: 312.8,
-      lixoColetado: 1890,
-      patrocinador: null
-    }
-  ]);
-
-  // Simulação de carregamento inicial
   useEffect(() => {
-    setTimeout(() => setIsLoading(false), 1500);
-  }, []);
+    if (!isFirebaseReady || !db) return;
 
-  // Simulação de atualização de estatísticas (Impacto em Tempo Real)
-  useEffect(() => {
-    const interval = setInterval(() => {
-      setStats(prev => ({
-        lixoColetado: prev.lixoColetado + Math.floor(Math.random() * 15),
-        kmLimpos: prev.kmLimpos + (Math.random() > 0.6 ? 1 : 0.5).toFixed(1) * 1,
-        robosAtivos: prev.robosAtivos,
-        pesquisasAtivas: prev.pesquisasAtivas
+    // --- 1. Busca de Estatísticas de Impacto (Coleção: stats) ---
+    const statsDocRef = doc(db, `artifacts/${appId}/public/data/stats/global`);
+    
+    // Tenta inicializar os dados se o documento não existir (apenas para simulação inicial)
+    const initializeData = async () => {
+        try {
+            const docSnap = await getDoc(statsDocRef);
+            if (!docSnap.exists()) {
+                 await setDoc(statsDocRef, {
+                    lixoColetado: 45230,
+                    kmLimpos: 1847.5,
+                    robosAtivos: 8,
+                    pesquisasAtivas: 127
+                 });
+                 // Cria robôs iniciais
+                 await setDoc(doc(db, `artifacts/${appId}/public/data/robots`, 'robo_1'), { nome: 'Guardião I', lat: 50, lng: 35, status: 'operacao', kmLimpos: 234.5, lixoColetado: 1450, patrocinador: 'Petrobras' });
+                 await setDoc(doc(db, `artifacts/${appId}/public/data/robots`, 'robo_2'), { nome: 'Protetor II', lat: 45, lng: 60, status: 'carregando', kmLimpos: 198.2, lixoColetado: 1120, patrocinador: 'Vale' });
+                 await setDoc(doc(db, `artifacts/${appId}/public/data/robots`, 'robo_3'), { nome: 'Onda Azul III', lat: 70, lng: 45, status: 'operacao', kmLimpos: 312.8, lixoColetado: 1890, patrocinador: null });
+            }
+        } catch (error) {
+            // Captura silenciosamente erros de permissão/timing durante a inicialização assíncrona.
+            console.warn("Aviso: Falha na inicialização de dados (provavelmente erro de permissão ou dados já existem). onSnapshot tentará a leitura.", error);
+        }
+    };
+    initializeData();
+
+    const unsubscribeStats = onSnapshot(statsDocRef, (docSnap) => {
+        if (docSnap.exists()) {
+            const data = docSnap.data();
+            setStats({
+                lixoColetado: data.lixoColetado || 0,
+                kmLimpos: data.kmLimpos ? data.kmLimpos * 1 : 0, // Garante que é um número
+                robosAtivos: data.robosAtivos || 0,
+                pesquisasAtivas: data.pesquisasAtivas || 0,
+            });
+        }
+        setIsLoading(false);
+    }, (error) => console.error("Erro ao buscar estatísticas:", error)); // Callback de erro de onSnapshot
+
+    // --- 2. Busca de Dados de Rastreamento (Coleção: robots) ---
+    const robotsQuery = query(collection(db, `artifacts/${appId}/public/data/robots`));
+    const unsubscribeRobots = onSnapshot(robotsQuery, (snapshot) => {
+      const robotsData = snapshot.docs.map(doc => ({
+        id: doc.id,
+        ...doc.data()
       }));
-    }, 8000);
-    return () => clearInterval(interval);
-  }, []);
+      setRobots(robotsData);
+    }, (error) => console.error("Erro ao buscar robôs:", error)); // Callback de erro de onSnapshot
 
-  // Simulação de movimento dos robôs (Tracking)
-  useEffect(() => {
-    const interval = setInterval(() => {
-      setRobots(prev => prev.map(robot => ({
-        ...robot,
-        lat: Math.max(10, Math.min(90, robot.lat + (Math.random() - 0.5) * 5)),
-        lng: Math.max(10, Math.min(90, robot.lng + (Math.random() - 0.5) * 5)),
-        kmLimpos: robot.status === 'operacao' ? robot.kmLimpos + 0.2 : robot.kmLimpos,
-        lixoColetado: robot.status === 'operacao' ? robot.lixoColetado + Math.floor(Math.random() * 8) : robot.lixoColetado
-      })));
-    }, 12000);
-    return () => clearInterval(interval);
-  }, []);
+    return () => {
+      unsubscribeStats();
+      unsubscribeRobots();
+    };
+  }, [db, isFirebaseReady, appId]);
 
   return { isLoading, stats, robots };
 };
 
-// --- Componentes Particionados ---
+
+// --- Componentes Reutilizáveis (Simulando Módulos) ---
+
+// Componente de Modal (Bloco)
+const SimpleModal = ({ children, title, isOpen, onClose, isSuccess }) => {
+  if (!isOpen) return null;
+
+  return (
+    <div className="fixed inset-0 bg-primary-navy bg-opacity-90 flex items-center justify-center z-[1000]">
+      <div className="p-8 max-w-lg w-full" style={{ backgroundColor: COLORS.neutralWhite, color: COLORS.neutralBlack }}>
+        <div className="flex justify-between items-center mb-6 border-b pb-4" style={{ borderColor: COLORS.accentCyan }}>
+          <div className="flex items-center">
+            {isSuccess ? 
+                <Check size={28} className="mr-3" style={{ color: COLORS.accentCyan }}/> : 
+                <AlertTriangle size={28} className="mr-3 text-red-600"/>
+            }
+            <h3 className="text-2xl font-bold" style={{ color: COLORS.primaryNavy }}>{title}</h3>
+          </div>
+          <button onClick={onClose} className="p-2 hover:bg-neutral-100 transition-colors">
+            <X size={24} />
+          </button>
+        </div>
+        <div>{children}</div>
+      </div>
+    </div>
+  );
+};
+
 
 // 1. Componente de Cartão de Estatística
 const StatCard = ({ value, label, icon: Icon, suffix = '' }) => (
@@ -100,7 +158,7 @@ const StatCard = ({ value, label, icon: Icon, suffix = '' }) => (
   </div>
 );
 
-// 2. Componente de Cabeçalho e Navegação
+// 2. Componente de Cabeçalho (Simulando Header.jsx)
 const Header = ({ menuOpen, setMenuOpen }) => (
   <header className="sticky top-0 z-50 border-b-2" style={{ backgroundColor: COLORS.primaryNavy, color: COLORS.neutralWhite, borderColor: COLORS.accentCyan }}>
     <div className="container mx-auto px-6">
@@ -172,7 +230,7 @@ const ImpactSection = ({ isLoading, stats }) => (
         <div className="w-20 h-1 mx-auto mb-6" style={{ backgroundColor: COLORS.accentCyan }}></div>
         <h2 className="text-5xl font-bold mb-4" style={{ color: COLORS.primaryNavy }}>Impacto em Tempo Real</h2>
         <p className="text-lg text-neutral-600 max-w-2xl mx-auto">
-          Dados atualizados automaticamente via API. Transparência total sobre nossa operação e resultados.
+          Dados atualizados automaticamente via Firestore. Transparência total sobre nossa operação e resultados.
         </p>
       </div>
 
@@ -336,40 +394,115 @@ const ResearchSection = () => (
 );
 
 // 7. Componente de Formulário de Patrocínio
-const SponsorshipForm = () => {
+const SponsorshipForm = ({ db, userId, openModal }) => {
   const [formData, setFormData] = useState({
     nome: '', cargo: '', empresa: '', email: '', telefone: '', orcamento: '', mensagem: ''
   });
   const [isSubmitted, setIsSubmitted] = useState(false);
+  const [isLlmLoading, setIsLlmLoading] = useState(false);
+  const [llmInput, setLlmInput] = useState(''); // Novo estado para input da IA
+  const [citations, setCitations] = useState([]); // NOVO: Estado para armazenar as fontes/citações
 
   const handleFormChange = (field, value) => {
     setFormData(prev => ({ ...prev, [field]: value }));
-    setIsSubmitted(false); // Limpa o feedback ao começar a digitar
   };
 
-  const handleFormSubmit = (e) => {
+  // Função para gerar rascunho de proposta usando a API Gemini
+  const generateProposalDraft = useCallback(async () => {
+    if (formData.empresa.trim() === '' || llmInput.trim() === '') {
+        openModal(false, "Entrada Inválida", "Por favor, preencha o nome da empresa e os focos ESG antes de gerar o rascunho.");
+        return;
+    }
+    
+    setIsLlmLoading(true);
+    setFormData(prev => ({ ...prev, mensagem: "Gerando rascunho... (Usando IA e pesquisa em tempo real) Por favor, aguarde." }));
+    setCitations([]); // Limpa citações anteriores
+
+    try {
+        const systemPrompt = `Aja como um especialista em Sustentabilidade e ESG. Sua tarefa é criar um parágrafo conciso e impactante (máximo 150 palavras) que sirva como rascunho de uma mensagem de patrocínio corporativo. O rascunho deve conectar os objetivos de sustentabilidade da empresa (${formData.empresa}) com a missão do Instituto Maré Futuro (robótica autônoma para limpeza de oceanos e geração de dados científicos). Use os seguintes focos chave fornecidos pelo usuário: "${llmInput}". O tom deve ser profissional e focado no retorno de investimento e ESG.`;
+        const userQuery = `Gerar rascunho de proposta de patrocínio para a empresa ${formData.empresa} com foco em: ${llmInput}. Use dados e tendências atuais sobre poluição marinha e ESG, se possível.`;
+
+        const payload = {
+            contents: [{ parts: [{ text: userQuery }] }],
+            tools: [{ "google_search": {} }], // Usando Google Search Grounding
+            systemInstruction: { parts: [{ text: systemPrompt }] },
+        };
+
+        const response = await fetchWithExponentialBackoff(API_URL, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify(payload)
+        });
+
+        const result = await response.json();
+        const candidate = result.candidates?.[0];
+        const generatedText = candidate?.content?.parts?.[0]?.text || "Falha ao gerar texto. Tente novamente.";
+        
+        // NOVO: Extrair fontes de grounding
+        let sourceList = [];
+        const groundingMetadata = candidate?.groundingMetadata;
+        if (groundingMetadata && groundingMetadata.groundingAttributions) {
+            sourceList = groundingMetadata.groundingAttributions
+                .map(attribution => ({
+                    uri: attribution.web?.uri,
+                    title: attribution.web?.title,
+                }))
+                .filter(source => source.uri && source.title);
+        }
+        setCitations(sourceList);
+        
+        // Atualiza o campo de mensagem com o texto gerado
+        setFormData(prev => ({ ...prev, mensagem: generatedText }));
+
+    } catch (error) {
+        console.error("Gemini API Error:", error);
+        setFormData(prev => ({ ...prev, mensagem: "Desculpe, houve um erro na geração de IA. Tente reduzir a complexidade do pedido." }));
+        openModal(false, "Erro de Geração de IA", "Não foi possível gerar o rascunho da proposta. Verifique o console para detalhes.");
+    } finally {
+        setIsLlmLoading(false);
+    }
+  }, [formData.empresa, llmInput, openModal]);
+
+  // Função para salvar a proposta no Firestore
+  const handleFormSubmit = async (e) => {
     e.preventDefault();
     
-    // Simulação de envio
-    console.log('Dados do Patrocínio:', formData);
+    if (!db || !userId) {
+        openModal(false, "Erro de Conexão", "Não foi possível conectar ao sistema de banco de dados. Tente novamente mais tarde.");
+        return;
+    }
 
-    // Feedback visual ao usuário (substituindo o alert proibido)
     setIsSubmitted(true);
-    setTimeout(() => {
+    
+    const appId = typeof __app_id !== 'undefined' ? __app_id : 'default-app-id';
+
+    try {
+        await addDoc(collection(db, `artifacts/${appId}/public/data/sponsorship_requests`), {
+            ...formData,
+            userId: userId,
+            timestamp: new Date().toISOString()
+        });
+
+        openModal(true, "Proposta Enviada com Sucesso!", "Agradecemos o seu interesse. Nossa equipe de Parcerias entrará em contato em até 48 horas úteis para discutir a sua contribuição.");
         setFormData({ nome: '', cargo: '', empresa: '', email: '', telefone: '', orcamento: '', mensagem: '' });
+        
+    } catch (error) {
+        console.error("Erro ao enviar proposta:", error);
+        openModal(false, "Erro ao Enviar Proposta", "Houve um erro no sistema. Por favor, tente novamente ou entre em contato direto.");
+    } finally {
         setIsSubmitted(false);
-    }, 4000);
+    }
   };
 
-  const InputField = ({ type = 'text', placeholder, field, required = true, isFullWidth = false }) => (
+  const InputField = ({ type = 'text', placeholder, field, required = true, isFullWidth = false, disabled = false }) => (
     <input
       type={type}
       placeholder={placeholder}
       value={formData[field]}
       onChange={(e) => handleFormChange(field, e.target.value)}
       className={`px-5 py-4 border-2 border-neutral-300 focus:border-accent-cyan outline-none text-base ${isFullWidth ? 'w-full' : ''}`}
-      style={{ borderColor: isSubmitted ? COLORS.accentCyan : '' }}
       required={required}
+      disabled={isSubmitted || disabled}
     />
   );
   
@@ -387,12 +520,7 @@ const SponsorshipForm = () => {
 
           <form onSubmit={handleFormSubmit} className="bg-white text-neutral-black p-10">
             <div className="space-y-6">
-              {isSubmitted && (
-                <div className="bg-accent-cyan text-white p-4 text-center font-bold mb-4">
-                  PROPOSTA ENVIADA COM SUCESSO! Nossa equipe entrará em contato em breve.
-                </div>
-              )}
-
+              
               <div className="grid md:grid-cols-2 gap-6">
                 <InputField placeholder="Nome Completo *" field="nome" />
                 <InputField placeholder="Cargo *" field="cargo" />
@@ -410,6 +538,7 @@ const SponsorshipForm = () => {
                 onChange={(e) => handleFormChange('orcamento', e.target.value)}
                 className="w-full px-5 py-4 border-2 border-neutral-300 focus:border-accent-cyan outline-none text-base"
                 required
+                disabled={isSubmitted}
               >
                 <option value="" disabled>Orçamento Estimado *</option>
                 <option value="10k-50k">R$ 10.000 - R$ 50.000</option>
@@ -417,6 +546,49 @@ const SponsorshipForm = () => {
                 <option value="100k-500k">R$ 100.000 - R$ 500.000</option>
                 <option value="500k+">Acima de R$ 500.000</option>
               </select>
+              
+              {/* --- BLOCO DE IA PARA GERAÇÃO DE MENSAGEM (EXPANDIDO) --- */}
+              <div className='border-2 border-neutral-200 p-4'>
+                <p className='text-sm font-bold mb-3' style={{ color: COLORS.primaryNavy }}>✨ Ferramenta de Rascunho ESG</p>
+                <div className="flex gap-3">
+                    <input
+                      type="text"
+                      placeholder="Focos ESG da Empresa (Ex: Inovação, Biodiversidade, Reciclagem) *"
+                      value={llmInput}
+                      onChange={(e) => setLlmInput(e.target.value)}
+                      className="w-full px-4 py-3 border-2 border-neutral-300 focus:border-accent-cyan outline-none text-base"
+                      disabled={isLlmLoading || isSubmitted}
+                    />
+                    <button
+                        type="button"
+                        onClick={generateProposalDraft}
+                        className={`px-4 py-3 font-bold text-sm tracking-wider flex items-center justify-center transition-colors whitespace-nowrap ${isLlmLoading ? 'bg-gray-400 opacity-60' : 'bg-accent-cyan hover:opacity-80'}`}
+                        style={{ backgroundColor: COLORS.accentCyan, color: COLORS.neutralWhite }}
+                        disabled={isLlmLoading || isSubmitted}
+                    >
+                        {isLlmLoading ? 'IA PENSANDO...' : '✨ GERAR RASCUNHO'}
+                    </button>
+                </div>
+                
+                {/* NOVO: Exibição do estado de carregamento/fontes */}
+                {isLlmLoading && (
+                    <div className='mt-4 text-center py-2 text-sm font-semibold' style={{color: COLORS.accentCyan}}>
+                        Gerando conteúdo... Pode levar até 10 segundos.
+                    </div>
+                )}
+
+                {citations.length > 0 && !isLlmLoading && (
+                    <div className='mt-4 pt-3 border-t border-neutral-300'>
+                        <p className='text-xs font-bold text-primary-navy mb-1'>Fontes (Pesquisa Google para ESG):</p>
+                        <ul className='text-xs text-neutral-700 list-disc list-inside space-y-1'>
+                            {citations.map((source, index) => (
+                                <li key={index}><a href={source.uri} target="_blank" rel="noopener noreferrer" className="hover:text-accent-cyan underline">{source.title}</a></li>
+                            ))}
+                        </ul>
+                    </div>
+                )}
+              </div>
+              {/* --------------------------------------------------- */}
 
               <textarea
                 placeholder="Mensagem: O que sua empresa busca patrocinar? *"
@@ -425,19 +597,21 @@ const SponsorshipForm = () => {
                 onChange={(e) => handleFormChange('mensagem', e.target.value)}
                 className="w-full px-5 py-4 border-2 border-neutral-300 focus:border-accent-cyan outline-none resize-none text-base"
                 required
+                disabled={isSubmitted || isLlmLoading}
               ></textarea>
 
               <button
                 type="submit"
                 className="w-full px-10 py-5 font-bold text-sm tracking-wider hover:opacity-90 transition-colors flex items-center justify-center gap-3"
                 style={{ backgroundColor: COLORS.accentCyan, color: COLORS.neutralWhite }}
+                disabled={isSubmitted || isLlmLoading}
               >
-                ENVIAR PROPOSTA
+                {isSubmitted ? 'ENVIANDO...' : 'ENVIAR PROPOSTA'}
                 <ChevronRight size={20} />
               </button>
 
-              <p className="text-xs text-neutral-600 text-center">
-                Ao enviar, você concorda com nossa Política de Privacidade. Responderemos em até 48 horas úteis.
+              <p className="text-xs text-neutral-300 text-center">
+                Ao enviar, você concorda com nossa Política de Privacidade.
               </p>
             </div>
           </form>
@@ -447,7 +621,7 @@ const SponsorshipForm = () => {
   );
 };
 
-// 8. Componente de Rodapé
+// 8. Componente de Rodapé (Simulando Footer.jsx)
 const Footer = () => (
   <footer className="py-16" style={{ backgroundColor: COLORS.neutralBlack, color: COLORS.neutralWhite }}>
     <div className="container mx-auto px-6">
@@ -503,15 +677,70 @@ const Footer = () => (
   </footer>
 );
 
-// --- Componente Principal ---
+// --- Componente Principal (Simulando Index.jsx) ---
 const InstitutoMareFuturo = () => {
   const [menuOpen, setMenuOpen] = useState(false);
   const [selectedRobot, setSelectedRobot] = useState(null);
-
-  // Utiliza o Custom Hook para gerenciar o estado e a simulação de dados
-  const { isLoading, stats, robots } = useMareFuturoData();
   
-  // Define o robô selecionado como o primeiro por padrão, se nenhum estiver selecionado
+  // --- FIREBASE STATES ---
+  const [db, setDb] = useState(null);
+  const [userId, setUserId] = useState(null);
+  const [isFirebaseReady, setIsFirebaseReady] = useState(false);
+
+  // --- MODAL STATES ---
+  const [isModalOpen, setIsModalOpen] = useState(false);
+  const [modalTitle, setModalTitle] = useState('');
+  const [modalMessage, setModalMessage] = useState('');
+  const [modalIsSuccess, setModalIsSuccess] = useState(false);
+
+  const openModal = (isSuccess, title, message) => {
+    setModalIsSuccess(isSuccess);
+    setModalTitle(title);
+    setModalMessage(message);
+    setIsModalOpen(true);
+  };
+  
+  // --- FIREBASE INITIALIZATION AND AUTHENTICATION ---
+  useEffect(() => {
+    try {
+        const firebaseConfig = typeof __firebase_config !== 'undefined' ? JSON.parse(__firebase_config) : {};
+        const app = initializeApp(firebaseConfig);
+        const firestore = getFirestore(app);
+        const firebaseAuth = getAuth(app);
+
+        setDb(firestore);
+
+        // Define a função de autenticação
+        const authenticate = async () => {
+            try {
+                if (typeof __initial_auth_token !== 'undefined' && __initial_auth_token !== '') {
+                    await signInWithCustomToken(firebaseAuth, __initial_auth_token);
+                } else {
+                    await signInAnonymously(firebaseAuth);
+                }
+            } catch (error) {
+                console.error("Authentication Error:", error);
+                await signInAnonymously(firebaseAuth); // Fallback to anonymous
+            }
+        };
+        authenticate();
+
+        onAuthStateChanged(firebaseAuth, (user) => {
+            if (user) {
+                setUserId(user.uid);
+            }
+            setIsFirebaseReady(true);
+        });
+
+    } catch (error) {
+        console.error("Falha ao inicializar o Firebase:", error);
+    }
+  }, []);
+
+  // Utiliza o Custom Hook para gerenciar o estado e a busca de dados do Firestore
+  const { isLoading, stats, robots } = useMareFuturoData(db, isFirebaseReady);
+  
+  // Define o robô selecionado como o primeiro por padrão
   useEffect(() => {
     if (robots.length > 0 && !selectedRobot) {
         setSelectedRobot(robots[0]);
@@ -521,14 +750,33 @@ const InstitutoMareFuturo = () => {
   return (
     <div className="min-h-screen bg-neutral-50 font-sans">
       <Header menuOpen={menuOpen} setMenuOpen={setMenuOpen} />
+      
       <main>
         <HeroSection />
         <ImpactSection isLoading={isLoading} stats={stats} />
         <TrackingSection robots={robots} selectedRobot={selectedRobot} setSelectedRobot={setSelectedRobot} />
         <ResearchSection />
-        <SponsorshipForm />
+        <SponsorshipForm db={db} userId={userId} openModal={openModal} />
       </main>
+      
       <Footer />
+
+      {/* MODAL DE CONFIRMAÇÃO DE ENVIO */}
+      <SimpleModal 
+        isOpen={isModalOpen} 
+        onClose={() => setIsModalOpen(false)} 
+        title={modalTitle}
+        isSuccess={modalIsSuccess}
+      >
+        <p className="text-lg mb-4">{modalMessage}</p>
+        <button 
+          onClick={() => setIsModalOpen(false)} 
+          className="w-full px-6 py-3 font-bold text-sm" 
+          style={{ backgroundColor: COLORS.accentCyan, color: COLORS.neutralWhite }}
+        >
+          FECHAR
+        </button>
+      </SimpleModal>
     </div>
   );
 };
