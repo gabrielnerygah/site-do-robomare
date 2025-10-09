@@ -1,7 +1,7 @@
 <?php
 $pageTitle = 'Gerenciar Usuários';
 require_once '../includes/admin_header.php';
-require_once '../includes/db.php';
+require_once '../includes/config.php';
 $auth->requireAdmin(); // APENAS ADMIN PODE ACESSAR
 
 $db = Database::getInstance()->getConnection();

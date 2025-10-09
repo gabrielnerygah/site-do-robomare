@@ -1,7 +1,7 @@
 <?php
 $pageTitle = 'Editar Estatísticas';
 require_once '../includes/admin_header.php';
-require_once '../includes/db.php';
+require_once '../includes/config.php';
 
 $db = Database::getInstance()->getConnection();
 $message = '';
